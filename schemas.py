@@ -31,6 +31,11 @@ class DeepSearchRequest(BaseModel):
     url: str
 
 
+class CompareRequest(BaseModel):
+    before: str              
+    after: str               
+    expectation: str
+
 # --- SAM3 Segment ---
 
 class SegmentRequest(BaseModel):

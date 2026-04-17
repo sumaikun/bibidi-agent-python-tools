@@ -4,11 +4,12 @@ Routes: /detect, /see, /embed, /find
 
 from fastapi import APIRouter, HTTPException
 
-from vision_api.schemas import DetectRequest, SeeRequest, EmbedRequest, FindRequest, DeepSearchRequest
+from vision_api.schemas import DetectRequest, SeeRequest, EmbedRequest, FindRequest, DeepSearchRequest, CompareRequest
 from vision_api.services import detect as detect_svc
 from vision_api.services import see as see_svc
 from vision_api.services import embed as embed_svc
 from vision_api.services import deep_search as deep_search_svc
+from vision_api.services import compare as compare_svc
 
 router = APIRouter()
 
@@ -38,3 +39,8 @@ def find(req: FindRequest):
 @router.post("/deep_search")
 async def deep_search(req: DeepSearchRequest):
     return await deep_search_svc.deep_search(req.screenshot, req.question, req.url)
+
+
+@router.post("/compare")
+def compare(req: CompareRequest):
+    return compare_svc.compare(req.before, req.after, req.expectation)
