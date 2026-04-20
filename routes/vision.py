@@ -26,14 +26,20 @@ async def see(req: SeeRequest):
  
 @router.post("/embed")
 def embed(req: EmbedRequest):
-    return embed_svc.embed(req.url, req.elements)
- 
- 
+    print(f"[EMBED] url={req.url} input={len(req.elements)}", flush=True)
+    result = embed_svc.embed(req.url, req.elements)
+    print(f"[EMBED] url={req.url} result={result}", flush=True)
+    return result
+
+
 @router.post("/find")
 def find(req: FindRequest):
+    print(f"[FIND]  url={req.url} query={req.query} limit={req.limit}", flush=True)
     result = embed_svc.find(req.url, req.query, req.limit)
     if result is None:
+        print(f"[FIND]  url={req.url} → 404 not indexed", flush=True)
         raise HTTPException(404, f"No elements cached for URL: {req.url} — call /embed first")
+    print(f"[FIND]  url={req.url} → {len(result.get('matches', []))} matches", flush=True)
     return result
 
 @router.post("/deep_search")

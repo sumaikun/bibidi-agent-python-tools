@@ -16,7 +16,7 @@ router = APIRouter()
 
 
 @router.post("/detect_grid")
-def api_detect_grid(req: DetectGridRequest):
+async def api_detect_grid(req: DetectGridRequest):
     image_bytes = base64.b64decode(req.screenshot)
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -40,7 +40,7 @@ def api_detect_grid(req: DetectGridRequest):
 
 
 @router.post("/solve")
-def api_solve(req: SolveRequest):
+async def api_solve(req: SolveRequest):
     return captcha_svc.solve(
         req.screenshot, req.object_hint, req.rows, req.cols, req.min_overlap,
     )

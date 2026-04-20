@@ -7,7 +7,7 @@ After that, import any model handle directly:
     from vision_api.models import ui_yolo, sam3_finder, ...
 """
 
-import easyocr
+from rapidocr_onnxruntime import RapidOCR
 import torch
 from txtai.embeddings import Embeddings
 from ultralytics import YOLO
@@ -19,7 +19,7 @@ from vision_api.services.segment import SAM3UIFinder
 
 ui_yolo: YOLO | None = None
 captcha_yolo: YOLO | None = None
-ocr_reader: easyocr.Reader | None = None
+ocr_reader: RapidOCR | None = None
 sam3_finder: SAM3UIFinder | None = None
 embeddings: Embeddings | None = None
 
@@ -42,13 +42,11 @@ def load_all():
     print("[2/5] CAPTCHA YOLO...")
     captcha_yolo = YOLO(CAPTCHA_MODEL_PATH)
 
-    print("[3/5] EasyOCR...")
-    ocr_reader = easyocr.Reader(["en"], gpu=True, verbose=False)
-    ocr_reader.detector.float()
+    print("[3/5] RappidOCR ...")
+    ocr_reader = RapidOCR()
 
     print("[4/5] SAM3...")
     sam3_finder = SAM3UIFinder()
-    torch.set_default_dtype(torch.float32)
 
     print("[5/5] txtai embeddings...")
     embeddings = Embeddings({"path": "sentence-transformers/all-MiniLM-L6-v2"})

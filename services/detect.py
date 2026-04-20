@@ -19,7 +19,7 @@ from vision_api.utils import center, image_size, page_key
 
 
 def run_yolo(image_bytes: bytes, img_w: int, img_h: int) -> list[dict]:
-    """Run custom UI YOLO + EasyOCR on raw image bytes. Skips elements with no OCR text."""
+    """Run custom UI YOLO + RapidOCR on raw image bytes. Skips elements with no OCR text."""
     img_np = np.array(Image.open(BytesIO(image_bytes)).convert("RGB"))
     results = models.ui_yolo.predict(source=img_np, conf=YOLO_CONFIDENCE, verbose=False)
     elements = []
@@ -31,9 +31,17 @@ def run_yolo(image_bytes: bytes, img_w: int, img_h: int) -> list[dict]:
             conf = round(float(box.conf), 3)
 
             crop = img_np[y1:y2, x1:x2]
-            with torch.amp.autocast('cuda', enabled=False):
-                texts = models.ocr_reader.readtext(crop, detail=0) if crop.size > 0 else []
+
+            # RapidOCR swap — no more autocast wrapper, no more torch contamination
+            if crop.size > 0:
+                ocr_result, _ = models.ocr_reader(crop)
+                texts = [item[1] for item in (ocr_result or [])]
+            else:
+                texts = []
+
             text = " ".join(texts).strip()
+            
+            #print("text", text)
 
             if not text:
                 continue

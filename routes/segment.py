@@ -21,6 +21,18 @@ from vision_api.services.segment import draw_sam3_results
 router = APIRouter()
 
 
+def grid_is_valid(g: dict | None) -> bool:
+    if not g:
+        return False
+    try:
+        return (
+            g.get("rows", 0) > 0 and g.get("cols", 0) > 0
+            and g.get("x2", 0) > g.get("x1", 0)
+            and g.get("y2", 0) > g.get("y1", 0)
+        )
+    except (TypeError, AttributeError):
+        return False
+
 @router.post("/segment")
 async def segment(req: SegmentRequest):
     if models.sam3_finder is None:
@@ -40,6 +52,8 @@ async def segment(req: SegmentRequest):
 
         raw_results = models.sam3_finder.find_multiple(str(image_path), req.prompts)
 
+        print("raw_results",raw_results)
+        
         results = []
         for r in raw_results:
             polygon = r.get("polygon")
@@ -51,16 +65,12 @@ async def segment(req: SegmentRequest):
             click_targets = None
 
             if r["found"] and r["bbox"]:
-                if req.grid:
-                    mask = r.get("mask")
-                    if mask is not None:
-                        cells = map_mask_to_cells(
-                            [mask], req.grid,
-                            req.grid.get("rows", 3), req.grid.get("cols", 3),
-                        )
-                        click_targets = [{"x": c["x"], "y": c["y"]} for c in cells if c["click"]]
-                    else:
-                        click_target = {"x": r["bbox"]["center_x"], "y": r["bbox"]["center_y"]}
+                if grid_is_valid(req.grid) and r.get("mask") is not None:
+                    cells = map_mask_to_cells(
+                        [r["mask"]], req.grid,
+                        req.grid["rows"], req.grid["cols"],
+                    )
+                    click_targets = [{"x": c["x"], "y": c["y"]} for c in cells if c["click"]]
                 else:
                     click_target = {"x": r["bbox"]["center_x"], "y": r["bbox"]["center_y"]}
 

@@ -1,8 +1,13 @@
 """
 CAPTCHA solving service.
 
-Pipeline: detect grid (YOLO) → identify object + dims (VLM) →
-segment object (SAM3 direct) → map mask to grid cells → click targets.
+Pipeline: determine object + dims (VLM) → segment object (SAM3 direct) →
+detect grid (YOLO) → map mask to grid cells → click targets.
+
+Order note: SAM3 runs before YOLO/VLM when an object_hint is provided.
+The route must be declared `async def` so it runs on the event loop —
+a sync `def` route drops the call into a threadpool worker where SAM3's
+first forward pass fails with a bf16/fp32 mismatch.
 """
 
 import base64
@@ -19,7 +24,7 @@ import numpy as np
 from PIL import Image
 
 from vision_api.config import CAPTCHA_OUTPUT_DIR, YOLO_CONFIDENCE
-from vision_api import models 
+from vision_api import models
 from vision_api.vlm import vlm_see, text_chat
 
 
@@ -54,7 +59,6 @@ def ask_vlm(image_path: str) -> dict:
     """Two-stage: VLM analyzes image → text LLM parses to JSON."""
     image_data = open(image_path, "rb").read()
 
-    # Stage 1: Free visual analysis
     print("  [VLM] Stage 1: analyzing image...")
     description = vlm_see(
         "This is a CAPTCHA image. Describe:\n"
@@ -63,9 +67,9 @@ def ask_vlm(image_path: str) -> dict:
         "Count them carefully.",
         image_data=image_data,
     )
-    print(f"  [VLM] says: {description[:200]}...")
+    #print(f"  [VLM] says: {description[:200]}...")
+    print(f"  [VLM] says: {description}")
 
-    # Stage 2: Parse to JSON with text LLM
     print("  [VLM] Stage 2: parsing with text LLM...")
     text = text_chat(
         "Extract the following from this CAPTCHA description and "
@@ -100,41 +104,22 @@ def ask_vlm(image_path: str) -> dict:
 # SAM3 DIRECT SEGMENTATION
 # ============================================
 
-def segment_object(screenshot_b64: str, prompt: str) -> list[dict]:
-    """Segment using SAM3UIFinder directly (no HTTP round-trip)."""
-    image_bytes = base64.b64decode(screenshot_b64)
-    img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
-    h, w = img.shape[:2]
+def segment_object(image_path: str, prompt: str) -> list[dict]:
+    """Segment all instances of `prompt` in the image via SAM3."""
+    raw_results = models.sam3_finder.find_multiple(image_path, [prompt])
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sam3_captcha_"))
-    image_path = tmp_dir / "input.jpg"
-    try:
-        cv2.imwrite(str(image_path), img)
-        raw_results = models.sam3_finder.find_multiple(str(image_path), [prompt])
-
-        results = []
-        for r in raw_results:
-            if not r["found"]:
-                continue
-            b = r["bbox"]
-            mask = r.get("mask")
-            if mask is None:
-                mask = np.zeros((h, w), dtype=np.uint8)
-                if r.get("polygon") and len(r["polygon"]) >= 3:
-                    pts = np.array(r["polygon"], dtype=np.int32)
-                    cv2.fillPoly(mask, [pts], 1)
-                else:
-                    mask[b["y1"]:b["y2"], b["x1"]:b["x2"]] = 1
-
-            results.append({
-                "found": True, "prompt": r["prompt"],
-                "instance_id": r.get("instance_id", 0),
-                "bbox": b, "mask": mask,
-                "mask_area_px": r["mask_area_px"],
-            })
-        return results
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return [
+        {
+            "found": True,
+            "prompt": r["prompt"],
+            "instance_id": r.get("instance_id", 0),
+            "bbox": r["bbox"],
+            "mask": r["mask"],
+            "mask_area_px": r["mask_area_px"],
+        }
+        for r in raw_results
+        if r["found"]
+    ]
 
 
 # ============================================
@@ -148,6 +133,11 @@ def map_mask_to_cells(
     """Map merged masks onto grid cells, return all cells with hit status."""
     gx1, gy1 = grid["x1"], grid["y1"]
     gx2, gy2 = grid["x2"], grid["y2"]
+
+    if rows <= 0 or cols <= 0 or gx2 <= gx1 or gy2 <= gy1:
+        print(f"  [grid] Invalid grid: {rows}x{cols} bbox=({gx1},{gy1})->({gx2},{gy2})")
+        return []
+
     cell_w = (gx2 - gx1) / cols
     cell_h = (gy2 - gy1) / rows
 
@@ -248,59 +238,69 @@ def solve(screenshot_b64: str, object_hint: str = "", rows: int = 0, cols: int =
     5. Draw annotated debug image
     6. Return click targets
     """
-    image_bytes = base64.b64decode(screenshot_b64)
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        tmp.write(image_bytes)
-        tmp_path = tmp.name
+    if models.sam3_finder is None:
+        return {"solved": False, "error": "SAM3 model not loaded yet", "click_targets": []}
 
     try:
-        img_pil = Image.open(tmp_path)
-        img_w, img_h = img_pil.size
+        image_bytes = base64.b64decode(screenshot_b64)
+        pil_img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    except Exception as e:
+        return {"solved": False, "error": f"Invalid image bytes: {e}", "click_targets": []}
+
+    img_w, img_h = pil_img.size
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sam3_solve_"))
+    image_path = tmp_dir / "input.jpg"
+
+    try:
+        pil_img.save(str(image_path))
+
         print(f"\n{'=' * 50}")
-        print(f"  [solve] image: {img_w}x{img_h}, mode={img_pil.mode}")
+        print(f"  [solve] image: {img_w}x{img_h}")
         print(f"{'=' * 50}")
 
-        # Step 1: Detect grid
-        print("\n[1] Detecting grid...")
-        grid = detect_grid(tmp_path)
-        if grid is None:
-            return {"solved": False, "error": "No CAPTCHA grid detected", "click_targets": []}
-        print(f"  ✓ Grid: ({grid['x1']},{grid['y1']})->({grid['x2']},{grid['y2']}) "
-              f"size={grid['width']}x{grid['height']} conf={grid['confidence']}")
-
-        # Step 2: Object + grid dims
+        # --- Determine target (VLM only if caller didn't provide hints) ---
         prompt = object_hint
         if not prompt or rows == 0 or cols == 0:
-            print("\n[2] Asking VLM...")
-            vlm = ask_vlm(tmp_path)
-            prompt = prompt or vlm.get("object", "")
-            rows = rows or vlm.get("rows", 0)
-            cols = cols or vlm.get("cols", 0)
+            print("\n[1] Asking VLM for target + grid dims...")
+            try:
+                vlm = ask_vlm(str(image_path))
+                prompt = prompt or vlm.get("object", "")
+                rows = rows or vlm.get("rows", 0)
+                cols = cols or vlm.get("cols", 0)
+            except Exception as e:
+                return {
+                    "solved": False,
+                    "error": f"VLM failed: {e}. Retry or pass object_hint/rows/cols manually.",
+                    "click_targets": [],
+                    "vlm_error": True,
+                }
 
-        if not prompt or rows == 0 or cols == 0:
+        if not prompt:
             return {
                 "solved": False,
-                "error": f"Could not determine params: object='{prompt}' rows={rows} cols={cols}",
-                "click_targets": [], "grid": grid,
+                "error": f"Could not determine target object: '{prompt}'",
+                "click_targets": [],
             }
 
         # Normalize grid — reCAPTCHA is always 3x3 or 4x4
-        if rows != cols:
-            total = rows * cols
-            rows, cols = (3, 3) if total <= 9 else (4, 4)
-            print(f"  Grid normalized: {rows}x{cols}")
+        if rows and cols and rows != cols:
+            # VLM is more reliable counting rows than cols — trust rows as the
+            # canonical grid size (reCAPTCHA is always square: 3x3 or 4x4).
+            cols = rows
+            # Clamp to valid reCAPTCHA sizes
+            if rows not in (3, 4):
+                rows = cols = 4 if rows > 3 else 3
+            print(f"  Grid normalized to rows: {rows}x{cols}")
 
-        print(f"  ✓ Find '{prompt}' in {rows}x{cols} grid")
-
-        # Step 3: Segment (direct)
-        print(f"\n[3] Running SAM3 for '{prompt}'...")
-        found = segment_object(screenshot_b64, prompt)
+        # --- SAM3 segmentation ---
+        print(f"\n[2] Running SAM3 for '{prompt}'...")
+        found = segment_object(str(image_path), prompt)
         if not found:
             return {
                 "solved": False,
                 "error": f"SAM3 found nothing for '{prompt}'",
-                "click_targets": [], "grid": grid,
+                "click_targets": [],
                 "prompt": prompt, "rows": rows, "cols": cols,
             }
 
@@ -311,7 +311,30 @@ def solve(screenshot_b64: str, object_hint: str = "", rows: int = 0, cols: int =
                   f"bbox=({r['bbox']['x1']},{r['bbox']['y1']})->"
                   f"({r['bbox']['x2']},{r['bbox']['y2']})")
 
-        # Step 4: Map to grid
+        # --- Grid detection (YOLO) ---
+        print("\n[3] Detecting grid...")
+        grid = detect_grid(str(image_path))
+        if grid is None:
+            return {
+                "solved": False,
+                "error": "No CAPTCHA grid detected",
+                "click_targets": [],
+                "prompt": prompt, "sam3_instances": len(found),
+            }
+        print(f"  ✓ Grid: ({grid['x1']},{grid['y1']})->({grid['x2']},{grid['y2']}) "
+              f"size={grid['width']}x{grid['height']} conf={grid['confidence']}")
+
+        if rows == 0 or cols == 0:
+            return {
+                "solved": False,
+                "error": f"Missing grid dims: rows={rows} cols={cols}",
+                "click_targets": [], "grid": grid,
+                "prompt": prompt,
+            }
+
+        print(f"  ✓ Mapping '{prompt}' in {rows}x{cols} grid")
+
+        # --- Map masks to grid cells ---
         print(f"\n[4] Mapping masks to {rows}x{cols} grid...")
         cells = map_mask_to_cells(masks, grid, rows, cols, min_overlap)
 
@@ -320,9 +343,9 @@ def solve(screenshot_b64: str, object_hint: str = "", rows: int = 0, cols: int =
         for c in click_cells:
             print(f"    [{c['row']},{c['col']}] center=({c['x']},{c['y']}) overlap={c['overlap']}px")
 
-        # Step 5: Draw
+        # --- Draw annotated debug image ---
         print("\n[5] Drawing analysis...")
-        annotated_path = draw_captcha_analysis(tmp_path, grid, cells, masks, prompt, rows, cols)
+        annotated_path = draw_captcha_analysis(str(image_path), grid, cells, masks, prompt, rows, cols)
         print(f"  ✓ Saved: {annotated_path}")
 
         click_targets = [
@@ -343,4 +366,4 @@ def solve(screenshot_b64: str, object_hint: str = "", rows: int = 0, cols: int =
         }
 
     finally:
-        os.unlink(tmp_path)
+        shutil.rmtree(tmp_dir, ignore_errors=True)

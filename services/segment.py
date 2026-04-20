@@ -87,30 +87,37 @@ class SAM3UIFinder:
         )
         print("SAM3 ready.")
 
-    def find_multiple(self, image_path: str, prompts: list[str]) -> list[dict]:
+    def find_in_array(self, img_bgr: np.ndarray, prompts: list[str]) -> list[dict]:
         """
-        Find ALL instances of each prompt in the image.
-        Returns a flat list of detections with masks.
+        Find instances of each prompt in an already-loaded BGR image array.
+        The canonical entry point — avoids disk round-trips when the caller
+        already has the image in memory.
         """
-        img = cv2.imread(image_path)
-        if img is None:
-            raise FileNotFoundError(f"Cannot read image: {image_path}")
-        H, W = img.shape[:2]
+        if img_bgr is None or img_bgr.size == 0:
+            raise ValueError("Empty image array")
+        H, W = img_bgr.shape[:2]
 
+        # SAM3 video predictor needs a frames directory on disk
         temp_dir = Path(tempfile.mkdtemp(prefix="sam3_ui_"))
         frame_path = temp_dir / "frame_000000.jpg"
-        cv2.imwrite(str(frame_path), img)
+        cv2.imwrite(str(frame_path), img_bgr)
 
         all_results = []
         try:
             for prompt in prompts:
                 prompt = prompt.strip()
-                instances = self._run_single_prompt(temp_dir, prompt, W, H)
-                all_results.extend(instances)
+                all_results.extend(self._run_single_prompt(temp_dir, prompt, W, H))
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-        return all_results
+        return all_results    
+            
+    def find_multiple(self, image_path: str, prompts: list[str]) -> list[dict]:
+        """Backward-compatible path-based entry point."""
+        img = cv2.imread(image_path)
+        if img is None:
+            raise FileNotFoundError(f"Cannot read image: {image_path}")
+        return self.find_in_array(img, prompts)
 
     def _run_single_prompt(self, frames_dir: Path, prompt: str, W: int, H: int) -> list[dict]:
         """
@@ -118,11 +125,13 @@ class SAM3UIFinder:
         Splits merged masks into individual instances via connected components.
         """
         instances = []
-
+        session_id = None
+        
         try:
             response = self.predictor.handle_request(dict(
                 type="start_session", resource_path=str(frames_dir),
             ))
+            
             session_id = response["session_id"]
 
             self.predictor.handle_request(dict(
@@ -168,13 +177,16 @@ class SAM3UIFinder:
                         "mask": mask, "mask_area_px": int(np.sum(mask > 0)),
                     })
 
-            self.predictor.handle_request(dict(
-                type="close_session", session_id=session_id,
-            ))
-
         except Exception as e:
             print(f"  ERROR processing '{prompt}': {e}")
         finally:
+            if session_id is not None:
+                try:
+                    self.predictor.handle_request(dict(
+                        type="close_session", session_id=session_id,
+                    ))
+                except Exception as e:
+                    print(f"  WARN: close_session failed for {session_id}: {e}")
             torch.cuda.empty_cache()
 
         if not instances:
